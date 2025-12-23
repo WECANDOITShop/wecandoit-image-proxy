@@ -1,7 +1,7 @@
-// Netlify Function: netlify/functions/convert-image.js
-// This function downloads the Jotform image and converts it to base64
+// netlify/functions/convert-image.js
+// No dependencies version - uses built-in Node.js modules only
 
-const fetch = require('node-fetch');
+const https = require('https');
 
 exports.handler = async (event, context) => {
   // Enable CORS
@@ -46,22 +46,11 @@ exports.handler = async (event, context) => {
 
     console.log('Fetching image:', imageUrl);
 
-    // Fetch the image from Jotform
-    const response = await fetch(imageUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; ImageProxy/1.0)'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
-    }
-
-    // Get the image as a buffer
-    const buffer = await response.buffer();
+    // Fetch the image using native https module
+    const buffer = await fetchImage(imageUrl);
     
-    // Get content type
-    const contentType = response.headers.get('content-type') || 'image/png';
+    // Detect content type from URL or default to PNG
+    const contentType = imageUrl.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' : 'image/png';
     
     // Convert to base64
     const base64 = buffer.toString('base64');
@@ -95,3 +84,42 @@ exports.handler = async (event, context) => {
     };
   }
 };
+
+/**
+ * Fetch image using native https module (no dependencies needed)
+ */
+function fetchImage(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (response) => {
+      // Handle redirects
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        const redirectUrl = response.headers.location;
+        console.log('Following redirect to:', redirectUrl);
+        return resolve(fetchImage(redirectUrl));
+      }
+
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
+        return;
+      }
+
+      const chunks = [];
+      
+      response.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      
+      response.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer);
+      });
+      
+      response.on('error', (error) => {
+        reject(error);
+      });
+      
+    }).on('error', (error) => {
+      reject(error);
+    });
+  });
+}
