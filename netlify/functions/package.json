@@ -1,8 +1,0 @@
-{
-  "name": "wecandoit-image-proxy",
-  "version": "1.0.0",
-  "description": "Serverless proxy to convert Jotform images",
-  "dependencies": {
-    "node-fetch": "^2.6.7"
-  }
-}
