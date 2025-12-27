@@ -30,16 +30,32 @@ exports.handler = async (event, context) => {
   if (event.httpMethod === 'POST') {
     try {
       console.log('Received webhook, content-type:', event.headers['content-type']);
-      console.log('Body (first 200 chars):', event.body.substring(0, 200));
+      console.log('Body type:', typeof event.body);
+      console.log('Body (first 500 chars):', event.body ? event.body.substring(0, 500) : 'EMPTY');
 
       let rawData;
       
-      // Jotform sends form-encoded data, not JSON
-      if (event.headers['content-type']?.includes('application/x-www-form-urlencoded')) {
+      // Jotform sends form-encoded data OR multipart/form-data
+      const contentType = event.headers['content-type'] || '';
+      
+      if (contentType.includes('application/x-www-form-urlencoded') || 
+          contentType.includes('multipart/form-data')) {
+        
+        // Parse form data
         const parsed = querystring.parse(event.body);
+        console.log('Parsed keys:', Object.keys(parsed));
+        
         // Jotform wraps everything in 'rawRequest' parameter
-        rawData = JSON.parse(parsed.rawRequest || '{}');
+        if (parsed.rawRequest) {
+          console.log('Found rawRequest, parsing JSON...');
+          rawData = JSON.parse(parsed.rawRequest);
+        } else {
+          // Fallback: maybe it's directly in the body
+          console.log('No rawRequest found, trying direct parse...');
+          rawData = parsed;
+        }
       } else {
+        // Direct JSON
         rawData = JSON.parse(event.body);
       }
 
