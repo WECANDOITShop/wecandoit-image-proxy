@@ -1,7 +1,7 @@
 // netlify/functions/jotform-webhook.js
 const crypto = require('crypto');
 
-// Simple in-memory storage (use database for production)
+// Simple in-memory storage
 const submissions = new Map();
 
 // Cleanup old submissions after 24 hours
@@ -13,6 +13,34 @@ setInterval(() => {
     }
   }
 }, 60 * 60 * 1000);
+
+// Parse multipart/form-data manually
+function parseMultipart(body, boundary) {
+  const parts = {};
+  const sections = body.split('--' + boundary);
+  
+  sections.forEach(section => {
+    if (!section || section === '--\r\n' || section === '--') return;
+    
+    // Extract field name from Content-Disposition header
+    const nameMatch = section.match(/name="([^"]+)"/);
+    if (!nameMatch) return;
+    
+    const fieldName = nameMatch[1];
+    
+    // Extract the value (everything after the headers)
+    const parts = section.split('\r\n\r\n');
+    if (parts.length < 2) return;
+    
+    // Get the value and remove trailing boundary markers
+    let value = parts.slice(1).join('\r\n\r\n').trim();
+    value = value.replace(/\r\n--$/, '').replace(/--$/, '');
+    
+    parts[fieldName] = value;
+  });
+  
+  return parts;
+}
 
 exports.handler = async (event, context) => {
   const headers = {
@@ -29,32 +57,55 @@ exports.handler = async (event, context) => {
   if (event.httpMethod === 'POST') {
     try {
       console.log('=== JOTFORM WEBHOOK ===');
-      console.log('Content-Type:', event.headers['content-type']);
+      const contentType = event.headers['content-type'] || '';
+      console.log('Content-Type:', contentType);
 
-      // Jotform sends data as application/x-www-form-urlencoded
-      // The body is a giant URL-encoded string
+      let rawData = null;
+
+      // Extract boundary from content-type
+      const boundaryMatch = contentType.match(/boundary=([^;]+)/);
       
-      // Decode the URL-encoded body manually
-      const decoded = decodeURIComponent(event.body);
-      console.log('Decoded body (first 500 chars):', decoded.substring(0, 500));
-      
-      // Try to parse as JSON
-      let rawData;
-      try {
-        rawData = JSON.parse(decoded);
-      } catch (e) {
-        console.log('Not direct JSON, trying to extract JSON...');
+      if (boundaryMatch) {
+        const boundary = boundaryMatch[1].replace(/"/g, '');
+        console.log('Boundary:', boundary);
         
-        // Sometimes Jotform wraps it - look for JSON structure
-        const jsonMatch = decoded.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          rawData = JSON.parse(jsonMatch[0]);
+        // Parse multipart data
+        const fields = parseMultipart(event.body, boundary);
+        console.log('Parsed fields:', Object.keys(fields));
+        
+        // Jotform sends the actual data in 'rawRequest' field
+        if (fields.rawRequest) {
+          console.log('Found rawRequest field');
+          try {
+            rawData = JSON.parse(fields.rawRequest);
+            console.log('✅ Parsed rawRequest as JSON');
+          } catch (e) {
+            console.error('Failed to parse rawRequest:', e.message);
+          }
         } else {
-          throw new Error('Could not find JSON in body');
+          console.log('Available fields:', Object.keys(fields));
+          // Try to find JSON in any field
+          for (const [key, value] of Object.entries(fields)) {
+            if (value.startsWith('{')) {
+              try {
+                rawData = JSON.parse(value);
+                console.log('✅ Found JSON in field:', key);
+                break;
+              } catch (e) {}
+            }
+          }
         }
       }
 
-      console.log('Parsed submission data');
+      if (!rawData) {
+        console.error('❌ Could not extract submission data');
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({ error: 'Could not parse submission data' })
+        };
+      }
+
       console.log('Submission ID:', rawData.submissionID);
       console.log('Form ID:', rawData.formID);
 
@@ -75,10 +126,8 @@ exports.handler = async (event, context) => {
         const name = (field.name || '').toLowerCase();
         const answer = field.answer;
         
-        console.log(`Field ${key}: name="${name}", type="${field.type}"`);
-        
         // Check for returnUrl field
-        if (name === 'returnurl' || key === 'returnurl') {
+        if (name === 'returnurl' || key.toLowerCase() === 'returnurl') {
           returnUrl = answer || field.text || '';
           console.log('Found returnUrl:', returnUrl);
         }
@@ -99,10 +148,15 @@ exports.handler = async (event, context) => {
         }
       });
 
-      console.log('Extracted:', { frontURL: !!frontURL, backURL: !!backURL, returnUrl: !!returnUrl });
+      console.log('Final extraction:', { 
+        hasFront: !!frontURL, 
+        hasBack: !!backURL, 
+        hasReturn: !!returnUrl 
+      });
 
       if (!returnUrl) {
         console.error('❌ Missing returnUrl!');
+        console.log('All fields:', Object.keys(rawData));
         return {
           statusCode: 400,
           headers,
@@ -123,13 +177,12 @@ exports.handler = async (event, context) => {
       });
 
       console.log('✅ Stored submission with token:', token);
-      console.log('Total submissions in memory:', submissions.size);
 
       // Redirect back to product page with token
       const redirectUrl = new URL(returnUrl);
       redirectUrl.searchParams.set('artwork_token', token);
 
-      console.log('Redirecting to:', redirectUrl.toString());
+      console.log('Redirecting to:', redirectUrl.toString().substring(0, 100) + '...');
 
       return {
         statusCode: 302,
@@ -148,8 +201,7 @@ exports.handler = async (event, context) => {
         statusCode: 500,
         headers,
         body: JSON.stringify({ 
-          error: error.message,
-          stack: error.stack
+          error: error.message
         })
       };
     }
@@ -170,9 +222,6 @@ exports.handler = async (event, context) => {
     const submission = submissions.get(token);
     
     if (!submission) {
-      console.log('Token not found:', token);
-      console.log('Available tokens:', Array.from(submissions.keys()));
-      
       return {
         statusCode: 404,
         headers,
