@@ -1,10 +1,11 @@
 // netlify/functions/jotform-webhook.js
 const crypto = require('crypto');
+const querystring = require('querystring');
 
 // Simple in-memory storage
 const submissions = new Map();
 
-// Cleanup old submissions after 24 hours
+// Cleanup old submissions
 setInterval(() => {
   const now = Date.now();
   for (const [token, data] of submissions.entries()) {
@@ -13,52 +14,6 @@ setInterval(() => {
     }
   }
 }, 60 * 60 * 1000);
-
-// Parse multipart/form-data manually
-function parseMultipart(body, boundary) {
-  const fields = {};
-  
-  // Split by boundary (handle both --boundary and --boundary--)
-  const delimiter = '--' + boundary;
-  const parts = body.split(delimiter);
-  
-  console.log('Total parts found:', parts.length);
-  
-  parts.forEach((part, index) => {
-    // Skip empty parts and closing boundary
-    if (!part || part.trim() === '' || part.trim() === '--') return;
-    
-    // Look for Content-Disposition header
-    const headerMatch = part.match(/Content-Disposition:[^\r\n]*name="([^"]+)"/i);
-    if (!headerMatch) {
-      console.log(`Part ${index}: No name found`);
-      return;
-    }
-    
-    const fieldName = headerMatch[1];
-    console.log(`Part ${index}: Found field "${fieldName}"`);
-    
-    // Find where headers end (double line break)
-    const headerEndMatch = part.match(/\r?\n\r?\n/);
-    if (!headerEndMatch) {
-      console.log(`Part ${index}: No header end found`);
-      return;
-    }
-    
-    // Extract value after headers
-    const headerEndIndex = headerEndMatch.index + headerEndMatch[0].length;
-    let value = part.substring(headerEndIndex);
-    
-    // Clean up trailing whitespace and boundary markers
-    value = value.replace(/\r?\n--$/, '').trim();
-    
-    console.log(`Part ${index}: Value length = ${value.length}`);
-    
-    fields[fieldName] = value;
-  });
-  
-  return fields;
-}
 
 exports.handler = async (event, context) => {
   const headers = {
@@ -75,48 +30,62 @@ exports.handler = async (event, context) => {
   if (event.httpMethod === 'POST') {
     try {
       console.log('=== JOTFORM WEBHOOK ===');
-      const contentType = event.headers['content-type'] || '';
-      console.log('Content-Type:', contentType);
+      console.log('Content-Type:', event.headers['content-type']);
+      console.log('Body length:', event.body ? event.body.length : 0);
 
       let rawData = null;
 
-      // Extract boundary from content-type
-      const boundaryMatch = contentType.match(/boundary=([^;]+)/);
-      
-      if (boundaryMatch) {
-        const boundary = boundaryMatch[1].replace(/"/g, '');
-        console.log('Boundary:', boundary);
+      // METHOD 1: Try parsing event.body as querystring (most common)
+      try {
+        const parsed = querystring.parse(event.body);
+        console.log('Method 1 - Querystring parsed keys:', Object.keys(parsed));
         
-        // Parse multipart data
-        const fields = parseMultipart(event.body, boundary);
-        console.log('Parsed fields:', Object.keys(fields));
-        
-        // Jotform sends the actual data in 'rawRequest' field
-        if (fields.rawRequest) {
-          console.log('Found rawRequest field');
-          try {
-            rawData = JSON.parse(fields.rawRequest);
-            console.log('✅ Parsed rawRequest as JSON');
-          } catch (e) {
-            console.error('Failed to parse rawRequest:', e.message);
+        if (parsed.rawRequest) {
+          console.log('Found rawRequest in querystring');
+          rawData = JSON.parse(parsed.rawRequest);
+          console.log('✅ Method 1 SUCCESS');
+        }
+      } catch (e) {
+        console.log('Method 1 failed:', e.message);
+      }
+
+      // METHOD 2: Try direct JSON parse
+      if (!rawData) {
+        try {
+          rawData = JSON.parse(event.body);
+          console.log('✅ Method 2 SUCCESS - Direct JSON');
+        } catch (e) {
+          console.log('Method 2 failed:', e.message);
+        }
+      }
+
+      // METHOD 3: Try decoding then parsing
+      if (!rawData) {
+        try {
+          const decoded = decodeURIComponent(event.body);
+          rawData = JSON.parse(decoded);
+          console.log('✅ Method 3 SUCCESS - Decoded JSON');
+        } catch (e) {
+          console.log('Method 3 failed:', e.message);
+        }
+      }
+
+      // METHOD 4: Look for JSON anywhere in the body
+      if (!rawData) {
+        try {
+          const jsonMatch = event.body.match(/\{[\s\S]*"submissionID"[\s\S]*\}/);
+          if (jsonMatch) {
+            rawData = JSON.parse(jsonMatch[0]);
+            console.log('✅ Method 4 SUCCESS - Extracted JSON from body');
           }
-        } else {
-          console.log('Available fields:', Object.keys(fields));
-          // Try to find JSON in any field
-          for (const [key, value] of Object.entries(fields)) {
-            if (value.startsWith('{')) {
-              try {
-                rawData = JSON.parse(value);
-                console.log('✅ Found JSON in field:', key);
-                break;
-              } catch (e) {}
-            }
-          }
+        } catch (e) {
+          console.log('Method 4 failed:', e.message);
         }
       }
 
       if (!rawData) {
-        console.error('❌ Could not extract submission data');
+        console.error('❌ All parsing methods failed');
+        console.log('Body preview:', event.body.substring(0, 500));
         return {
           statusCode: 400,
           headers,
@@ -124,18 +93,18 @@ exports.handler = async (event, context) => {
         };
       }
 
+      console.log('✅ Successfully parsed submission data');
       console.log('Submission ID:', rawData.submissionID);
       console.log('Form ID:', rawData.formID);
 
       const submissionID = rawData.submissionID;
       const formID = rawData.formID;
       
-      // Find file upload fields and returnUrl
+      // Extract file URLs and returnUrl
       let frontURL = '';
       let backURL = '';
       let returnUrl = '';
       
-      // Iterate through all fields in the submission
       Object.keys(rawData).forEach(key => {
         const field = rawData[key];
         
@@ -144,9 +113,11 @@ exports.handler = async (event, context) => {
         const name = (field.name || '').toLowerCase();
         const answer = field.answer;
         
-        // Check for returnUrl field
-        if (name === 'returnurl' || key.toLowerCase() === 'returnurl') {
-          returnUrl = answer || field.text || '';
+        console.log(`Field "${name}": type=${field.type}, hasAnswer=${!!answer}`);
+        
+        // Check for returnUrl
+        if (name === 'returnurl' || name.includes('return')) {
+          returnUrl = answer || field.text || field.prettyFormat || '';
           console.log('Found returnUrl:', returnUrl);
         }
         
@@ -157,10 +128,10 @@ exports.handler = async (event, context) => {
           if (typeof fileUrl === 'string' && fileUrl.includes('jotform.com')) {
             if (name.includes('front') || name.includes('upload front')) {
               frontURL = fileUrl;
-              console.log('Found front file:', fileUrl.substring(0, 80));
+              console.log('Found FRONT file');
             } else if (name.includes('back')) {
               backURL = fileUrl;
-              console.log('Found back file:', fileUrl.substring(0, 80));
+              console.log('Found BACK file');
             }
           }
         }
@@ -174,7 +145,14 @@ exports.handler = async (event, context) => {
 
       if (!returnUrl) {
         console.error('❌ Missing returnUrl!');
-        console.log('All fields:', Object.keys(rawData));
+        console.log('Dumping all fields for inspection:');
+        Object.keys(rawData).slice(0, 20).forEach(key => {
+          const field = rawData[key];
+          if (field && typeof field === 'object') {
+            console.log(`  ${key}: name="${field.name}", answer="${field.answer}"`);
+          }
+        });
+        
         return {
           statusCode: 400,
           headers,
@@ -195,8 +173,9 @@ exports.handler = async (event, context) => {
       });
 
       console.log('✅ Stored submission with token:', token);
+      console.log('Submissions in memory:', submissions.size);
 
-      // Redirect back to product page with token
+      // Redirect
       const redirectUrl = new URL(returnUrl);
       redirectUrl.searchParams.set('artwork_token', token);
 
@@ -212,15 +191,13 @@ exports.handler = async (event, context) => {
       };
 
     } catch (error) {
-      console.error('❌ Webhook error:', error);
+      console.error('❌ Fatal error:', error);
       console.error('Stack:', error.stack);
       
       return {
         statusCode: 500,
         headers,
-        body: JSON.stringify({ 
-          error: error.message
-        })
+        body: JSON.stringify({ error: error.message })
       };
     }
   }
@@ -240,6 +217,7 @@ exports.handler = async (event, context) => {
     const submission = submissions.get(token);
     
     if (!submission) {
+      console.log('Token not found:', token);
       return {
         statusCode: 404,
         headers,
@@ -247,7 +225,7 @@ exports.handler = async (event, context) => {
       };
     }
 
-    console.log('✅ Retrieved submission for token:', token);
+    console.log('✅ Retrieved submission');
 
     return {
       statusCode: 200,
