@@ -16,30 +16,48 @@ setInterval(() => {
 
 // Parse multipart/form-data manually
 function parseMultipart(body, boundary) {
-  const parts = {};
-  const sections = body.split('--' + boundary);
+  const fields = {};
   
-  sections.forEach(section => {
-    if (!section || section === '--\r\n' || section === '--') return;
+  // Split by boundary (handle both --boundary and --boundary--)
+  const delimiter = '--' + boundary;
+  const parts = body.split(delimiter);
+  
+  console.log('Total parts found:', parts.length);
+  
+  parts.forEach((part, index) => {
+    // Skip empty parts and closing boundary
+    if (!part || part.trim() === '' || part.trim() === '--') return;
     
-    // Extract field name from Content-Disposition header
-    const nameMatch = section.match(/name="([^"]+)"/);
-    if (!nameMatch) return;
+    // Look for Content-Disposition header
+    const headerMatch = part.match(/Content-Disposition:[^\r\n]*name="([^"]+)"/i);
+    if (!headerMatch) {
+      console.log(`Part ${index}: No name found`);
+      return;
+    }
     
-    const fieldName = nameMatch[1];
+    const fieldName = headerMatch[1];
+    console.log(`Part ${index}: Found field "${fieldName}"`);
     
-    // Extract the value (everything after the headers)
-    const parts = section.split('\r\n\r\n');
-    if (parts.length < 2) return;
+    // Find where headers end (double line break)
+    const headerEndMatch = part.match(/\r?\n\r?\n/);
+    if (!headerEndMatch) {
+      console.log(`Part ${index}: No header end found`);
+      return;
+    }
     
-    // Get the value and remove trailing boundary markers
-    let value = parts.slice(1).join('\r\n\r\n').trim();
-    value = value.replace(/\r\n--$/, '').replace(/--$/, '');
+    // Extract value after headers
+    const headerEndIndex = headerEndMatch.index + headerEndMatch[0].length;
+    let value = part.substring(headerEndIndex);
     
-    parts[fieldName] = value;
+    // Clean up trailing whitespace and boundary markers
+    value = value.replace(/\r?\n--$/, '').trim();
+    
+    console.log(`Part ${index}: Value length = ${value.length}`);
+    
+    fields[fieldName] = value;
   });
   
-  return parts;
+  return fields;
 }
 
 exports.handler = async (event, context) => {
